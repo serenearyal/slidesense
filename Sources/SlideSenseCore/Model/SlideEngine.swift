@@ -226,8 +226,8 @@ public final class SlideEngine {
         switch gesture.kind {
         case let .slider(target, edge, startLevel):
             if !gesture.moved {
-                // Decide once whether this finger slides the edge or moves the pointer.
-                // A pointer move leaves the band, goes sideways, or is a click-drag.
+                // Decide whether this finger slides the edge or moves the pointer.
+                // A pointer move leaves the band or is a click-drag.
                 if !geometry.band(edge, contains: point, margin: Self.bandMargin) || buttonDown() {
                     gesture.kind = .ignored
                     return
@@ -236,7 +236,11 @@ public final class SlideEngine {
                 let along = abs(dy)
                 guard hypot(across, along) >= Self.commitTravel else { return }
                 guard along >= across * Self.verticalBias else {
-                    gesture.kind = .ignored
+                    // Sideways so far. That is either the pointer, which soon leaves the
+                    // band, or a finger flattening on the glass: its centre drifts inwards
+                    // by up to 2.5 % before it slides. Measure again from here.
+                    gesture.startX = point.x
+                    gesture.startY = point.y
                     return
                 }
                 gesture.moved = true

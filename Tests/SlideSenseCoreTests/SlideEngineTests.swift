@@ -278,6 +278,14 @@ final class SlideEngineTests: XCTestCase {
         XCTAssertEqual(recorder.begins, [.volume])
     }
 
+    func testSidewaysSettleThenSlideStillCounts() {
+        let (engine, recorder) = makeEngine()
+        // The finger centre drifts inwards as it flattens, then the finger slides up.
+        let time = move(engine, from: (0.98, 0.36), to: (0.965, 0.36), at: 0)
+        move(engine, from: (0.965, 0.36), to: (0.965, 0.45), at: time + 0.008)
+        XCTAssertEqual(recorder.begins, [.volume])
+    }
+
     func testMoveThatLeavesTheBandIsPointer() {
         let (engine, recorder) = makeEngine()
         // Goes inwards out of the band first, then up.
@@ -307,6 +315,19 @@ final class SlideEngineTests: XCTestCase {
     }
 
     // MARK: - Recorded sessions
+
+    func testRecordedEdgeSlides() throws {
+        // 16 s of real edge use at a 12 % band: seven slides (five on the right edge,
+        // two on the left), two taps on the right edge and two pointer moves in the
+        // middle. The first slide starts with the finger centre drifting 2.5 %
+        // inwards while the finger flattens, before it moves up.
+        let (engine, recorder) = makeEngine { $0.edgeWidth = 0.12 }
+        try replay("edge-slides.jsonl", into: engine)
+        XCTAssertEqual(recorder.begins, [.volume, .volume, .volume, .brightness, .volume, .brightness, .volume])
+        XCTAssertEqual(recorder.ends.count, 7)
+        XCTAssertTrue(recorder.commands.isEmpty)
+        XCTAssertFalse(engine.isTrackingSlide)
+    }
 
     func testRecordedNormalUseDoesNothing() throws {
         // 56 s of real use: pointer moves, two- and three-finger gestures, clicks
