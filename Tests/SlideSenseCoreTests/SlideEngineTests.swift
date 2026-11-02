@@ -308,6 +308,17 @@ final class SlideEngineTests: XCTestCase {
 
     // MARK: - Recorded sessions
 
+    func testRecordedNormalUseDoesNothing() throws {
+        // 56 s of real use: pointer moves, two- and three-finger gestures, clicks
+        // and a 14 s click-drag, none of them on an edge.
+        let (engine, recorder) = makeEngine()
+        try replay("normal-use.jsonl", into: engine)
+        XCTAssertTrue(recorder.begins.isEmpty)
+        XCTAssertTrue(recorder.updates.isEmpty)
+        XCTAssertTrue(recorder.commands.isEmpty)
+        XCTAssertFalse(engine.isTrackingSlide)
+    }
+
     func testRecordedPointerMovesInTheMiddleDoNothing() throws {
         let (engine, recorder) = makeEngine()
         try replay("pointer-middle.jsonl", into: engine)
