@@ -38,13 +38,65 @@ final class SlideEngineTests: XCTestCase {
         configure(&config)
         engine.configuration = { config }
         engine.modifiers = { [] }
+        engine.buttonDown = { false }
         let recorder = Recorder()
         engine.delegate = recorder
         return (engine, recorder)
     }
 
-    private func frame(at time: TimeInterval, x: Double, y: Double, touching: Bool = true) -> TouchFrame {
-        TouchFrame(timestamp: time, contacts: [TouchContact(id: 1, x: x, y: y, isTouching: touching)])
+    private func frame(at time: TimeInterval, x: Double, y: Double, touching: Bool = true, id: Int32 = 1) -> TouchFrame {
+        TouchFrame(timestamp: time, contacts: [TouchContact(id: id, x: x, y: y, isTouching: touching)])
+    }
+
+    /// A one-finger move in `steps` frames, 8 ms apart like the real trackpad. Returns the end time.
+    @discardableResult
+    private func move(
+        _ engine: SlideEngine,
+        id: Int32 = 1,
+        from start: (x: Double, y: Double),
+        to end: (x: Double, y: Double),
+        at time: TimeInterval,
+        steps: Int = 12
+    ) -> TimeInterval {
+        for step in 0...steps {
+            let f = Double(step) / Double(steps)
+            engine.process(frame(
+                at: time + Double(step) * 0.008,
+                x: start.x + (end.x - start.x) * f,
+                y: start.y + (end.y - start.y) * f,
+                id: id
+            ))
+        }
+        return time + Double(steps) * 0.008
+    }
+
+    /// What a real lift sends (recorded on a MacBook Pro): the finger in the
+    /// "lifting" states 5, 6, 6, 7, then one empty frame, then nothing.
+    @discardableResult
+    private func lift(_ engine: SlideEngine, id: Int32 = 1, x: Double, y: Double, at time: TimeInterval) -> TimeInterval {
+        for (index, state) in [Int32(5), 6, 6, 7].enumerated() {
+            let raw = RawTouchFrame(t: time + Double(index + 1) * 0.008, contacts: [
+                RawTouch(id: id, state: state, x: x, y: y, size: 0.3)
+            ])
+            engine.process(TouchFrame(raw: raw))
+        }
+        engine.process(TouchFrame(timestamp: time + 0.04, contacts: []))
+        return time + 0.04
+    }
+
+    /// Replays a recording made with `SlideSense --record-touches`, button state included.
+    private func replay(_ name: String, into engine: SlideEngine) throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/\(name)")
+        let lines = try String(contentsOf: url, encoding: .utf8).split(separator: "\n")
+        var pressed = false
+        engine.buttonDown = { pressed }
+        for line in lines {
+            let raw = try JSONDecoder().decode(RawTouchFrame.self, from: Data(line.utf8))
+            pressed = raw.button ?? false
+            engine.process(TouchFrame(raw: raw))
+        }
     }
 
     func testRightSlideSenseChangesVolume() {
@@ -136,16 +188,132 @@ final class SlideEngineTests: XCTestCase {
         XCTAssertEqual(recorder.commands, [.next])
     }
 
-    func testDroppedContactKeepsSlideAlive() {
+    // MARK: - Lifting ends a slide
+
+    func testLiftEndsSlideAtOnce() {
         let (engine, recorder) = makeEngine()
-        engine.process(frame(at: 0.0, x: 0.95, y: 0.2))
-        engine.process(frame(at: 0.02, x: 0.95, y: 0.4))
-        // One stray frame with no contacts should not end the gesture.
-        engine.process(TouchFrame(timestamp: 0.04, contacts: []))
-        engine.process(frame(at: 0.05, x: 0.95, y: 0.55))
-        XCTAssertEqual(recorder.begins.count, 1)
-        XCTAssertEqual(recorder.ends.count, 0)
-        XCTAssertGreaterThan(recorder.updates.last?.1 ?? 0, 0.5)
+        let end = move(engine, from: (0.95, 0.2), to: (0.95, 0.5), at: 0)
+        XCTAssertEqual(recorder.begins, [.volume])
+
+        // The first "lifting" frame already ends it; the app must not wait for more frames.
+        engine.process(TouchFrame(raw: RawTouchFrame(t: end + 0.008, contacts: [
+            RawTouch(id: 1, state: 5, x: 0.95, y: 0.5, size: 0.3)
+        ])))
+        XCTAssertEqual(recorder.ends.count, 1)
+        XCTAssertFalse(engine.isTrackingSlide)
+    }
+
+    func testOtherEdgeRightAfterLiftChangesItsOwnLevel() {
+        let (engine, recorder) = makeEngine()
+        var time = move(engine, from: (0.95, 0.2), to: (0.95, 0.6), at: 0)
+        time = lift(engine, x: 0.95, y: 0.6, at: time)
+        let volumeUpdates = recorder.updates.count
+
+        // A new finger on the left edge 30 ms later: brightness, never volume.
+        move(engine, id: 2, from: (0.05, 0.2), to: (0.05, 0.6), at: time + 0.03)
+        XCTAssertEqual(recorder.begins, [.volume, .brightness])
+        XCTAssertTrue(recorder.updates.dropFirst(volumeUpdates).allSatisfy { $0.0 == .brightness })
+        XCTAssertFalse(recorder.updates.dropFirst(volumeUpdates).isEmpty)
+    }
+
+    func testPointerMoveAfterSlideDoesNotContinueIt() {
+        let (engine, recorder) = makeEngine()
+        var time = move(engine, from: (0.95, 0.2), to: (0.95, 0.6), at: 0)
+        time = lift(engine, x: 0.95, y: 0.6, at: time)
+        let updates = recorder.updates.count
+
+        // Two seconds later the user moves the pointer in the middle of the pad.
+        move(engine, id: 2, from: (0.5, 0.5), to: (0.6, 0.3), at: time + 2)
+        XCTAssertEqual(recorder.updates.count, updates)
+        XCTAssertEqual(recorder.begins, [.volume])
+        XCTAssertFalse(engine.isTrackingSlide)
+    }
+
+    func testNewFingerEndsOldSlideEvenWithoutLiftFrames() {
+        let (engine, recorder) = makeEngine()
+        let time = move(engine, from: (0.95, 0.2), to: (0.95, 0.6), at: 0)
+        // No lift frames at all, a different finger appears on the left edge.
+        move(engine, id: 2, from: (0.05, 0.2), to: (0.05, 0.6), at: time + 0.008)
+        XCTAssertEqual(recorder.ends.first?.0, .volume)
+        XCTAssertEqual(recorder.begins, [.volume, .brightness])
+    }
+
+    func testFrameAfterLongGapNeverContinuesSlide() {
+        let (engine, recorder) = makeEngine()
+        let time = move(engine, from: (0.95, 0.2), to: (0.95, 0.6), at: 0)
+        // The lift was lost, and the same id shows up again much later in the middle.
+        move(engine, from: (0.5, 0.5), to: (0.5, 0.2), at: time + 1)
+        XCTAssertEqual(recorder.ends.count, 1)
+        XCTAssertEqual(recorder.begins, [.volume])
+    }
+
+    func testLevelFollowsFingerBackToStart() {
+        var config = EngineConfiguration()
+        config.currentVolume = 0.5
+        let (engine, recorder) = makeEngine { $0 = config }
+        let time = move(engine, from: (0.95, 0.4), to: (0.95, 0.6), at: 0)
+        move(engine, from: (0.95, 0.6), to: (0.95, 0.4), at: time + 0.008)
+        XCTAssertEqual(recorder.updates.last?.1 ?? 0, 0.5, accuracy: 0.001)
+    }
+
+    // MARK: - Pointer moves are not slides
+
+    func testSidewaysMoveFromEdgeIsPointer() {
+        let (engine, recorder) = makeEngine()
+        move(engine, from: (0.95, 0.5), to: (0.7, 0.52), at: 0)
+        XCTAssertTrue(recorder.begins.isEmpty)
+        XCTAssertTrue(recorder.updates.isEmpty)
+    }
+
+    func testDiagonalMoveFromEdgeIsPointer() {
+        let (engine, recorder) = makeEngine()
+        // 45 degrees on the real pad: 0.05 across is as long as 0.08 up.
+        move(engine, from: (0.95, 0.3), to: (0.9, 0.38), at: 0)
+        XCTAssertTrue(recorder.begins.isEmpty)
+    }
+
+    func testSlightlySlantedSlideStillCounts() {
+        let (engine, recorder) = makeEngine()
+        move(engine, from: (0.95, 0.2), to: (0.93, 0.6), at: 0)
+        XCTAssertEqual(recorder.begins, [.volume])
+    }
+
+    func testMoveThatLeavesTheBandIsPointer() {
+        let (engine, recorder) = makeEngine()
+        // Goes inwards out of the band first, then up.
+        let time = move(engine, from: (0.9, 0.3), to: (0.7, 0.3), at: 0)
+        move(engine, from: (0.7, 0.3), to: (0.7, 0.7), at: time + 0.008)
+        XCTAssertTrue(recorder.begins.isEmpty)
+    }
+
+    func testClickDragFromEdgeIsPointer() {
+        let (engine, recorder) = makeEngine()
+        engine.buttonDown = { true }
+        move(engine, from: (0.95, 0.2), to: (0.95, 0.6), at: 0)
+        XCTAssertTrue(recorder.begins.isEmpty)
+    }
+
+    func testSlowMoveAlongBottomDoesNotSkipTrack() {
+        let (engine, recorder) = makeEngine()
+        // 0.3 across in 1 s: the pointer, not a flick.
+        move(engine, from: (0.8, 0.05), to: (0.5, 0.05), at: 0, steps: 125)
+        XCTAssertTrue(recorder.commands.isEmpty)
+    }
+
+    func testClimbingMoveFromBottomDoesNotSkipTrack() {
+        let (engine, recorder) = makeEngine()
+        move(engine, from: (0.8, 0.05), to: (0.5, 0.4), at: 0)
+        XCTAssertTrue(recorder.commands.isEmpty)
+    }
+
+    // MARK: - Recorded sessions
+
+    func testRecordedPointerMovesInTheMiddleDoNothing() throws {
+        let (engine, recorder) = makeEngine()
+        try replay("pointer-middle.jsonl", into: engine)
+        XCTAssertTrue(recorder.begins.isEmpty)
+        XCTAssertTrue(recorder.updates.isEmpty)
+        XCTAssertTrue(recorder.commands.isEmpty)
     }
 
     func testFineControlUsesQuarterSteps() {
@@ -170,6 +338,7 @@ final class SlideEngineTests: XCTestCase {
         config.requireModifier = .option
         engine.configuration = { config }
         engine.modifiers = { [] }
+        engine.buttonDown = { false }
         let recorder = Recorder()
         engine.delegate = recorder
 

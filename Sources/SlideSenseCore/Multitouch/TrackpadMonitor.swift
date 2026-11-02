@@ -1,4 +1,5 @@
 import CoreFoundation
+import CoreGraphics
 import Darwin
 import Foundation
 
@@ -24,9 +25,6 @@ struct MTTouch {
     var unknown5a: Int32
     var unknown5b: Int32
     var density: Float
-
-    /// The two states that mean "a finger is on the glass".
-    var isTouching: Bool { state == 3 || state == 4 }
 }
 
 struct MTPoint {
@@ -145,17 +143,18 @@ final class MultitouchLibrary {
 /// The private API has no user-data pointer, so one process-wide router
 /// forwards frames to whichever monitor is currently active.
 enum TouchRouter {
-    static let lock = NSLock()
-    static var handler: ((UnsafeMutablePointer<MTTouch>, Int, Double) -> Void)?
+    private static let lock = NSLock()
+    private static var current: ((UnsafeMutablePointer<MTTouch>?, Int, Double) -> Void)?
 
+    static var handler: ((UnsafeMutablePointer<MTTouch>?, Int, Double) -> Void)? {
+        get { lock.withLock { current } }
+        set { lock.withLock { current = newValue } }
+    }
+
+    /// Every frame is forwarded, also the empty one that follows the last lift.
     static let callback: MTFrameCallback = { _, touches, count, timestamp, _ in
-        lock.lock()
-        let handler = TouchRouter.handler
-        lock.unlock()
-
-        guard let handler, let touches, count > 0 else { return 0 }
-        let records = touches.assumingMemoryBound(to: MTTouch.self)
-        handler(records, Int(count), timestamp)
+        guard let handler = TouchRouter.handler else { return 0 }
+        handler(touches?.assumingMemoryBound(to: MTTouch.self), Int(max(count, 0)), timestamp)
         return 0
     }
 }
@@ -169,6 +168,8 @@ enum TouchRouter {
 public final class TrackpadMonitor {
     /// Set before calling `start()`. Delivered on the framework's touch thread.
     public var onFrame: ((TouchFrame) -> Void)?
+    /// Every frame as the framework reports it, empty frames included (`--record-touches`).
+    public var onRawFrame: ((RawTouchFrame) -> Void)?
 
     /// Flip the vertical axis for trackpads that report it the other way up.
     public var flipVertical = false
@@ -264,26 +265,25 @@ public final class TrackpadMonitor {
         return result
     }
 
-    private func handle(records: UnsafeMutablePointer<MTTouch>, count: Int, timestamp: Double) {
-        var contacts: [TouchContact] = []
-        contacts.reserveCapacity(count)
-
-        for index in 0..<count {
-            let record = records[index]
-            var y = Double(record.normalized.position.y)
-            if flipVertical { y = 1 - y }
-            contacts.append(
-                TouchContact(
+    private func handle(records: UnsafeMutablePointer<MTTouch>?, count: Int, timestamp: Double) {
+        var raw: [RawTouch] = []
+        if let records {
+            raw.reserveCapacity(count)
+            for index in 0..<count {
+                let record = records[index]
+                raw.append(RawTouch(
                     id: record.identifier,
+                    state: record.state,
                     x: Double(record.normalized.position.x),
-                    y: y,
-                    isTouching: record.isTouching
-                )
-            )
+                    y: Double(record.normalized.position.y),
+                    size: Double(record.size)
+                ))
+            }
         }
-
-        guard !contacts.isEmpty else { return }
-        onFrame?(TouchFrame(timestamp: timestamp, contacts: contacts))
+        let frame = RawTouchFrame(t: timestamp, contacts: raw)
+        onRawFrame?(frame)
+        // Empty frames are delivered too: the one after the last lift ends a gesture.
+        onFrame?(TouchFrame(raw: frame, flipVertical: flipVertical))
     }
 }
 
@@ -308,5 +308,38 @@ public enum TrackpadDiagnostics {
         print("Listening for \(Int(seconds))s — touch the trackpad…")
         RunLoop.current.run(until: Date().addingTimeInterval(seconds))
         monitor.stop()
+    }
+
+    /// Writes every raw frame to `path` as JSON lines, for bug reports and test fixtures.
+    public static func record(to path: String, seconds: Double) {
+        guard TrackpadMonitor.isAvailable else {
+            print("MultitouchSupport.framework is not available on this machine.")
+            return
+        }
+        guard FileManager.default.createFile(atPath: path, contents: nil),
+              let file = FileHandle(forWritingAtPath: path) else {
+            print("Cannot write \(path)")
+            return
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        var frames = 0
+        let monitor = TrackpadMonitor()
+        monitor.onRawFrame = { frame in
+            var frame = frame
+            frame.button = CGEventSource.buttonState(.combinedSessionState, button: .left)
+            guard let line = try? encoder.encode(frame) else { return }
+            file.write(line + Data("\n".utf8))
+            frames += 1
+        }
+        guard monitor.start() else {
+            print("No multitouch device found.")
+            return
+        }
+        print("Recording for \(Int(seconds))s to \(path). Do the gestures now…")
+        RunLoop.current.run(until: Date().addingTimeInterval(seconds))
+        monitor.stop()
+        try? file.close()
+        print("Done: \(frames) frames.")
     }
 }

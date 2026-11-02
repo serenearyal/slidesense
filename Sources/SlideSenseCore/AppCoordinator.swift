@@ -19,7 +19,11 @@ public final class AppCoordinator: NSObject, StatusItemDataSource {
 
     private var observers: [NSObjectProtocol] = []
     private var lastTouchRefresh: TimeInterval = 0
+    /// Frames arrive on the trackpad thread, resets come from the main thread.
+    /// This lock guards the engine and the pointer state between them.
+    private let pipelineLock = NSLock()
     private var frozen = false
+    private var pendingAnchor: CGPoint?
     private var freezeCursorEnabled = true
     private var hapticsEnabled = true
     private var hapticStrength: HapticStrength = .medium
@@ -106,8 +110,7 @@ public final class AppCoordinator: NSObject, StatusItemDataSource {
         audio.stopObserving()
         statusItem?.willOpen = nil
         monitor.stop()
-        engine.reset()
-        freezer.end()
+        resetPipeline()
         observers.forEach(NotificationCenter.default.removeObserver)
         observers.removeAll()
     }
@@ -115,6 +118,9 @@ public final class AppCoordinator: NSObject, StatusItemDataSource {
     // MARK: - Touch pipeline
 
     private func handle(_ frame: TouchFrame) {
+        pipelineLock.lock()
+        defer { pipelineLock.unlock() }
+
         // A slide starts from the live system level. Levels are cached and kept
         // fresh by the CoreAudio/DisplayServices callbacks, but re-read once when
         // a finger lands so a change made without a notification cannot make the
@@ -131,10 +137,31 @@ public final class AppCoordinator: NSObject, StatusItemDataSource {
         if engine.isTrackingSlide {
             if !frozen {
                 frozen = true
-                if freezeCursorEnabled { freezer.begin() }
+                if freezeCursorEnabled { freezer.begin(at: pendingAnchor) }
             }
             if freezeCursorEnabled { freezer.hold() }
-        } else if frozen {
+            return
+        }
+        if frozen {
+            frozen = false
+            freezer.end()
+        }
+        // Remember where the pointer was when the finger landed on an edge, so a
+        // slide puts it back there, not where its first millimetres moved it.
+        if engine.isPendingSlide {
+            if pendingAnchor == nil { pendingAnchor = CGEvent(source: nil)?.location }
+        } else {
+            pendingAnchor = nil
+        }
+    }
+
+    /// Drops any gesture and gives the pointer back.
+    private func resetPipeline() {
+        pipelineLock.lock()
+        defer { pipelineLock.unlock() }
+        engine.reset()
+        pendingAnchor = nil
+        if frozen {
             frozen = false
             freezer.end()
         }
@@ -194,7 +221,7 @@ public final class AppCoordinator: NSObject, StatusItemDataSource {
             if !monitor.isRunning { startMonitoring() }
         } else {
             monitor.stop()
-            engine.reset()
+            resetPipeline()
         }
 
         if lastLoginItemPreference != settings.openAtLogin {

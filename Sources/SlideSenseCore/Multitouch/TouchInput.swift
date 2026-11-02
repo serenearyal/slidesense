@@ -19,6 +19,42 @@ public struct TouchContact: Sendable, Equatable {
     }
 }
 
+/// One contact exactly as `MultitouchSupport` reports it, before any mapping.
+/// Recorded by `--record-touches` and replayed by the tests.
+public struct RawTouch: Codable, Sendable, Equatable {
+    public var id: Int32
+    /// 1-2 = hovering, 3 = make touch, 4 = touching, 5-7 = lifting.
+    public var state: Int32
+    public var x: Double
+    public var y: Double
+    public var size: Double
+
+    public init(id: Int32, state: Int32, x: Double, y: Double, size: Double) {
+        self.id = id
+        self.state = state
+        self.x = x
+        self.y = y
+        self.size = size
+    }
+
+    /// The two states that mean "a finger is on the glass" (make touch, touching).
+    public var isTouching: Bool { state == 3 || state == 4 }
+}
+
+/// One device frame, including the empty frame sent after the last finger lifts.
+public struct RawTouchFrame: Codable, Sendable {
+    public var t: TimeInterval
+    public var contacts: [RawTouch]
+    /// Whether the trackpad button was pressed (recordings only).
+    public var button: Bool?
+
+    public init(t: TimeInterval, contacts: [RawTouch], button: Bool? = nil) {
+        self.t = t
+        self.contacts = contacts
+        self.button = button
+    }
+}
+
 /// All contacts seen in one device frame.
 public struct TouchFrame: Sendable {
     public var timestamp: TimeInterval
@@ -31,6 +67,14 @@ public struct TouchFrame: Sendable {
 
     public var activeContacts: [TouchContact] {
         contacts.filter(\.isTouching)
+    }
+
+    /// Maps a raw frame the way the app sees it. Shared by `TrackpadMonitor` and the
+    /// replay tests, so recorded fixtures exercise the same path as the trackpad.
+    public init(raw: RawTouchFrame, flipVertical: Bool = false) {
+        self.init(timestamp: raw.t, contacts: raw.contacts.map {
+            TouchContact(id: $0.id, x: $0.x, y: flipVertical ? 1 - $0.y : $0.y, isTouching: $0.isTouching)
+        })
     }
 }
 

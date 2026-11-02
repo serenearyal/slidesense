@@ -20,6 +20,7 @@ let package = Package(
         .testTarget(
             name: "SlideSenseCoreTests",
             dependencies: ["SlideSenseCore"],
+            exclude: ["Fixtures"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]

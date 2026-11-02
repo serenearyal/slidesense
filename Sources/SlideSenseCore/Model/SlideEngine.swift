@@ -49,6 +49,21 @@ public final class SlideEngine {
     public var configuration: () -> EngineConfiguration = { EngineConfiguration() }
     /// Live modifier state, used for the "require modifier" and fine-control options.
     public var modifiers: () -> ModifierState = { .current }
+    /// Whether the trackpad button is pressed. A click-drag is never a slide.
+    public var buttonDown: () -> Bool = { CGEventSource.buttonState(.combinedSessionState, button: .left) }
+
+    /// A finger must travel this far (fraction of the pad height) before an edge decides what it is.
+    static let commitTravel = 0.02
+    /// A slide must be at least this many times more vertical than horizontal, in physical distance.
+    static let verticalBias = 2.0
+    /// The trackpad is about 1.6 times wider than it is tall, so x and y units differ in length.
+    static let padAspect = 1.6
+    /// How far a finger may drift past the band while an edge is still deciding.
+    static let bandMargin = 0.02
+    /// A media swipe must finish within this time; a slower move is the pointer.
+    static let mediaFlickTime = 0.25
+    /// No frame for this long means the finger is gone, whatever the last frame said.
+    static let staleFrameGap = 0.1
 
     private enum Kind {
         case slider(target: EdgeAction, edge: Edge, startLevel: Double)
@@ -58,6 +73,8 @@ public final class SlideEngine {
     }
 
     private struct Gesture {
+        /// The finger this gesture follows. Another finger never continues it.
+        var contactID: Int32
         var kind: Kind
         var startX: Double
         var startY: Double
@@ -69,7 +86,6 @@ public final class SlideEngine {
         var emittedLevel: Double
         var lastStep: Int
         var consumed: Bool
-        var lostFrames: Int
     }
 
     private var gesture: Gesture?
@@ -85,6 +101,17 @@ public final class SlideEngine {
         return false
     }
 
+    /// True while a finger rests on an edge that has not decided yet (used to remember
+    /// where the pointer was before the finger moved it).
+    public var isPendingSlide: Bool {
+        guard let gesture else { return false }
+        switch gesture.kind {
+        case .slider: return !gesture.moved
+        case .corner: return true
+        case .media, .ignored: return false
+        }
+    }
+
     // MARK: - Frame processing
 
     public func process(_ frame: TouchFrame) {
@@ -92,25 +119,28 @@ public final class SlideEngine {
         let active = frame.activeContacts
 
         if var current = gesture {
-            if active.isEmpty {
-                current.lostFrames += 1
-                // A tap ends the moment the finger lifts; a slide survives a
-                // few dropped frames so it does not stop halfway (1.8 fix).
-                if !current.moved || current.lostFrames > 5 || frame.timestamp - current.lastSeen > 0.12 {
-                    finish(current, at: frame.timestamp, config: config)
-                    gesture = nil
+            // A gesture ends in the first frame where its finger is no longer on the glass.
+            // After a lift the trackpad sends a few "lifting" frames and one empty frame,
+            // then nothing until the next touch, so waiting for more frames would keep a
+            // finished slide alive and hand it to whatever finger comes next.
+            let stale = frame.timestamp - current.lastSeen > Self.staleFrameGap
+            guard !stale, let point = active.first(where: { $0.id == current.contactID }) else {
+                finish(current, at: frame.timestamp, config: config)
+                gesture = nil
+                // A new finger in the same frame starts its own gesture.
+                if active.count == 1, let point = active.first {
+                    begin(contact: point, now: frame.timestamp, config: config)
                 }
                 return
             }
 
-            guard active.count == 1, let point = active.first else {
+            guard active.count == 1 else {
                 // Extra fingers mean the user wants a system gesture.
                 cancel(current)
                 gesture = nil
                 return
             }
 
-            current.lostFrames = 0
             current.lastX = point.x
             current.lastY = point.y
             current.lastSeen = frame.timestamp
@@ -120,7 +150,7 @@ public final class SlideEngine {
         }
 
         guard active.count == 1, let point = active.first else { return }
-        begin(point: CGPoint(x: point.x, y: point.y), now: frame.timestamp, config: config)
+        begin(contact: point, now: frame.timestamp, config: config)
     }
 
     /// Drops any in-flight gesture (e.g. the app was disabled).
@@ -131,9 +161,11 @@ public final class SlideEngine {
 
     // MARK: - Gesture lifecycle
 
-    private func begin(point: CGPoint, now: TimeInterval, config: EngineConfiguration) {
-        guard ModifierState.modifierRequirementSatisfied(config.requireModifier, by: modifiers()) else {
-            gesture = makeGesture(kind: .ignored, point: point, now: now, level: 0, fine: false, config: config)
+    private func begin(contact: TouchContact, now: TimeInterval, config: EngineConfiguration) {
+        let point = CGPoint(x: contact.x, y: contact.y)
+        let id = contact.id
+        guard ModifierState.modifierRequirementSatisfied(config.requireModifier, by: modifiers()), !buttonDown() else {
+            gesture = makeGesture(id: id, kind: .ignored, point: point, now: now, level: 0, fine: false, config: config)
             return
         }
 
@@ -141,26 +173,27 @@ public final class SlideEngine {
         let fine = isFine(config: config)
 
         if config.quickMuteEnabled, geometry.isQuickMuteCorner(point) {
-            gesture = makeGesture(kind: .corner, point: point, now: now, level: 0, fine: fine, config: config)
+            gesture = makeGesture(id: id, kind: .corner, point: point, now: now, level: 0, fine: fine, config: config)
             return
         }
 
         guard let edge = geometry.edge(at: point) else {
-            gesture = makeGesture(kind: .ignored, point: point, now: now, level: 0, fine: fine, config: config)
+            gesture = makeGesture(id: id, kind: .ignored, point: point, now: now, level: 0, fine: fine, config: config)
             return
         }
 
         switch edge {
         case .bottom:
             guard config.mediaStripEnabled else {
-                gesture = makeGesture(kind: .ignored, point: point, now: now, level: 0, fine: fine, config: config)
+                gesture = makeGesture(id: id, kind: .ignored, point: point, now: now, level: 0, fine: fine, config: config)
                 return
             }
-            gesture = makeGesture(kind: .media, point: point, now: now, level: 0, fine: fine, config: config)
+            gesture = makeGesture(id: id, kind: .media, point: point, now: now, level: 0, fine: fine, config: config)
         case .left, .right:
             let target = edge == .left ? config.leftEdge : config.rightEdge
             let level = target == .volume ? config.currentVolume : config.currentBrightness
             gesture = makeGesture(
+                id: id,
                 kind: .slider(target: target, edge: edge, startLevel: level),
                 point: point,
                 now: now,
@@ -175,9 +208,11 @@ public final class SlideEngine {
         let dx = point.x - gesture.startX
         let dy = point.y - gesture.startY
 
-        // Touching down inside the Quick Mute corner and then sliding is a
-        // volume/brightness slide, not a failed tap.
-        if case .corner = gesture.kind, abs(dy) > 0.012 {
+        let geometry = EdgeGeometry(edgeWidth: config.edgeWidth, bottomQuarterOnly: config.bottomQuarterOnly)
+
+        // Touching down inside the Quick Mute corner and then moving is a possible
+        // right-edge slide, not a failed tap; the slide rules below decide.
+        if case .corner = gesture.kind, hypot(dx * Self.padAspect, dy) > 0.012 {
             let target = config.rightEdge
             let level = target == .volume ? config.currentVolume : config.currentBrightness
             let steps = isFine(config: config) ? 64.0 : 16.0
@@ -190,13 +225,24 @@ public final class SlideEngine {
 
         switch gesture.kind {
         case let .slider(target, edge, startLevel):
-            guard abs(dy) > 0.006 else { return }
             if !gesture.moved {
+                // Decide once whether this finger slides the edge or moves the pointer.
+                // A pointer move leaves the band, goes sideways, or is a click-drag.
+                if !geometry.band(edge, contains: point, margin: Self.bandMargin) || buttonDown() {
+                    gesture.kind = .ignored
+                    return
+                }
+                let across = abs(dx) * Self.padAspect
+                let along = abs(dy)
+                guard hypot(across, along) >= Self.commitTravel else { return }
+                guard along >= across * Self.verticalBias else {
+                    gesture.kind = .ignored
+                    return
+                }
                 gesture.moved = true
                 delegate?.slideEngine(self, didBeginSlide: target)
             }
 
-            let geometry = EdgeGeometry(edgeWidth: config.edgeWidth, bottomQuarterOnly: config.bottomQuarterOnly)
             let span = geometry.travelSpan(for: edge)
             let raw = startLevel + (dy / span) * config.sensitivity
             let clamped = min(max(raw, 0), 1)
@@ -218,7 +264,17 @@ public final class SlideEngine {
         case .media:
             guard config.mediaStripEnabled else { return }
             if abs(dx) > 0.02 { gesture.moved = true }
-            guard abs(dx) > 0.12, !gesture.consumed else { return }
+            guard !gesture.consumed else { return }
+            // Only a quick, flat flick along the strip skips a track. A slower move,
+            // one that climbs, or one that leaves the strip is the pointer.
+            let flat = abs(dx) * Self.padAspect >= abs(dy) * Self.verticalBias
+            if !geometry.band(.bottom, contains: point, margin: Self.bandMargin)
+                || (gesture.moved && !flat)
+                || now - gesture.startTime > Self.mediaFlickTime {
+                gesture.kind = .ignored
+                return
+            }
+            guard abs(dx) > 0.12 else { return }
             gesture.consumed = true
             // Swiping left means "forward" on the media strip.
             var forward = dx < 0
@@ -275,6 +331,7 @@ public final class SlideEngine {
     // MARK: - Helpers
 
     private func makeGesture(
+        id: Int32,
         kind: Kind,
         point: CGPoint,
         now: TimeInterval,
@@ -284,6 +341,7 @@ public final class SlideEngine {
     ) -> Gesture {
         let steps = fine ? 64.0 : 16.0
         return Gesture(
+            contactID: id,
             kind: kind,
             startX: point.x,
             startY: point.y,
@@ -294,8 +352,7 @@ public final class SlideEngine {
             moved: false,
             emittedLevel: (level * steps).rounded() / steps,
             lastStep: Int((level * steps).rounded()),
-            consumed: false,
-            lostFrames: 0
+            consumed: false
         )
     }
 

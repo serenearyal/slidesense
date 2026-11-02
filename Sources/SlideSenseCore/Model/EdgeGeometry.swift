@@ -57,6 +57,19 @@ public struct EdgeGeometry: Sendable {
         return best.edge
     }
 
+    /// Whether a point is still inside one edge's band, plus `margin`. Unlike
+    /// `edge(at:)` this ignores the other bands, so a finger near a corner does not
+    /// "leave" its edge just because another edge is closer.
+    public func band(_ edge: Edge, contains point: CGPoint, margin: Double = 0) -> Bool {
+        let x = Double(point.x)
+        let y = Double(point.y)
+        switch edge {
+        case .left: return x <= edgeWidth + margin
+        case .right: return x >= 1 - edgeWidth - margin
+        case .bottom: return y <= edgeWidth + margin
+        }
+    }
+
     /// The top-right corner region used for Quick Mute.
     public func isQuickMuteCorner(_ point: CGPoint) -> Bool {
         let x = Double(point.x)

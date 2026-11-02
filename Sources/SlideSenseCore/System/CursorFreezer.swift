@@ -14,9 +14,10 @@ public final class CursorFreezer {
 
     public init() {}
 
-    public func begin() {
+    /// Starts holding the pointer at `point`, or where it is now.
+    public func begin(at point: CGPoint? = nil) {
         guard anchor == nil else { return }
-        anchor = CGEvent(source: nil)?.location
+        anchor = point ?? CGEvent(source: nil)?.location
         if CGDisplayHideCursor(CGMainDisplayID()) == .success {
             hidden = true
         }

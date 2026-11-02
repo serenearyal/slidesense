@@ -36,7 +36,7 @@ Sources/SlideSenseCore/
   Multitouch/  dlopen bindings for MultitouchSupport + TrackpadMonitor
   System/      CoreAudio, DisplayServices, media keys, haptics, permissions
   UI/          Menu bar item, settings window, HUD
-Sources/SlideSense/     entry point, --dump-touches, --diagnose, --demo-hud
+Sources/SlideSense/     entry point, --dump-touches, --record-touches, --diagnose, --demo-hud
 Tests/SlideSenseCoreTests/
 ```
 
@@ -78,6 +78,11 @@ swift run SlideSense --demo-hud      # cycles the HUD on screen
 `--dump-touches` prints normalised coordinates with `y` pointing towards the
 screen. If an edge feels inverted on your Mac, note your model and what you saw
 in the issue — it usually means the vertical axis needs flipping.
+
+To turn a gesture problem into a test, record it:
+`swift run SlideSense --record-touches touches.jsonl 30` writes 30 seconds of raw
+frames as JSON lines. Put the file in `Tests/SlideSenseCoreTests/Fixtures/` and
+replay it in `SlideEngineTests` with `replay(_:into:)`.
 
 ## Pull requests
 

@@ -7,6 +7,18 @@ if CommandLine.arguments.contains("--dump-touches") {
     exit(0)
 }
 
+// Records raw frames as JSON lines: `--record-touches FILE [seconds]`.
+if let index = CommandLine.arguments.firstIndex(of: "--record-touches") {
+    let args = CommandLine.arguments
+    guard index + 1 < args.count else {
+        print("usage: SlideSense --record-touches FILE [seconds]")
+        exit(1)
+    }
+    let seconds = index + 2 < args.count ? Double(args[index + 2]) ?? 30 : 30
+    TrackpadDiagnostics.record(to: args[index + 1], seconds: seconds)
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--diagnose") {
     Diagnostics.printReport()
     exit(0)
